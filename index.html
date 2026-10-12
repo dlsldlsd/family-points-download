@@ -58,18 +58,24 @@
   .result a { color: #4f8cff; font-size: 13px; }
   .result .label { font-size: 11px; color: #8b93a1; margin-bottom: 4px; }
   .small { font-size: 11px; color: #6b7280; margin-top: 12px; text-align: center; }
+  .prev {
+    font-size: 11px; color: #6b7280; margin-top: 10px;
+    padding: 8px; background: #1e222d; border-radius: 8px;
+    word-break: break-all; display: none;
+  }
+  .prev.show { display: block; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>📦 Загрузка APK</h1>
-  <p class="sub">Загрузи файл — получишь ссылку со случайным именем. Прошлый файл удалится автоматически.</p>
+  <p class="sub">Загрузи файл — получишь ссылку. Старая версия удалится только после того, как новая станет доступна.</p>
 
-  <label>GitHub токен (сохранится в браузере)</label>
+  <label>GitHub токен</label>
   <input type="password" id="token" placeholder="ghp_..." autocomplete="off">
 
   <label>Репозиторий (owner/repo)</label>
-  <input type="text" id="repo" placeholder="nekigy/family-points-updates" autocomplete="off">
+  <input type="text" id="repo" placeholder="dlsldlsd/family-points-download" autocomplete="off">
 
   <div class="drop" id="drop">
     <div class="icon">📤</div>
@@ -82,6 +88,7 @@
 
   <div class="status" id="status"></div>
   <div class="result" id="result"></div>
+  <div class="prev" id="prev"></div>
 
   <div class="small">Токен хранится только в этом браузере</div>
 </div>
@@ -95,15 +102,27 @@ const fileInput = $('file');
 const uploadBtn = $('upload');
 const status = $('status');
 const result = $('result');
+const prev = $('prev');
 
 let selectedFile = null;
 
-// Загружаем сохранённые данные
+// ============ Сохранение настроек ============
 tokenInput.value = localStorage.getItem('gh_token') || '';
 repoInput.value = localStorage.getItem('gh_repo') || '';
-updateBtn();
 
-// Сохраняем токен и репу при изменении
+// Показываем прошлую папку
+function showPrevFolder() {
+  const old = localStorage.getItem('gh_old_folder');
+  const url = localStorage.getItem('gh_last_url');
+  if (old) {
+    prev.innerHTML = `Предыдущая папка: <b>${old}</b>` + (url ? `<br><a href="${url}" target="_blank">${url}</a>` : '');
+    prev.className = 'prev show';
+  } else {
+    prev.className = 'prev';
+  }
+}
+showPrevFolder();
+
 tokenInput.addEventListener('input', () => {
   localStorage.setItem('gh_token', tokenInput.value.trim());
   updateBtn();
@@ -117,7 +136,7 @@ function updateBtn() {
   uploadBtn.disabled = !(selectedFile && tokenInput.value.trim() && repoInput.value.trim());
 }
 
-// Drag&drop
+// ============ Drag & drop ============
 drop.addEventListener('click', () => fileInput.click());
 drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('active'); });
 drop.addEventListener('dragleave', () => drop.classList.remove('active'));
@@ -137,22 +156,19 @@ function setFile(f) {
   updateBtn();
 }
 
+// ============ UI helpers ============
 function showStatus(msg, type = 'info') {
   status.textContent = msg;
   status.className = 'status show ' + type;
 }
-
 function hideStatus() { status.className = 'status'; }
-
 function showResult(url) {
-  result.innerHTML = `
-    <div class="label">Ссылка для скачивания:</div>
-    <a href="${url}" target="_blank">${url}</a>
-  `;
+  result.innerHTML = `<div class="label">Ссылка для скачивания:</div><a href="${url}" target="_blank">${url}</a>`;
   result.className = 'result show';
 }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// =============== GitHub API ===============
+// ============ GitHub API ============
 async function ghApi(path, opts = {}) {
   const [owner, repo] = repoInput.value.split('/');
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/${path}`, {
@@ -166,27 +182,26 @@ async function ghApi(path, opts = {}) {
   return res;
 }
 
-// Удаляем все старые папки (не первого уровня depth)
-async function cleanupOld() {
-  const res = await ghApi('contents');
-  if (!res.ok) return;
-  const items = await res.json();
-  for (const item of items) {
-    // Удаляем папки (не файлы типа index.html, .gitignore, README)
-    if (item.type === 'dir') {
-      // Рекурсивно удаляем содержимое
-      await deleteFolder(item.path);
-    }
+async function uploadFile(path, base64, message) {
+  const res = await ghApi('contents/' + path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, content: base64, branch: 'main' })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || 'Ошибка загрузки');
   }
+  return res.json();
 }
 
-async function deleteFolder(path) {
+async function deleteFolderRecursive(path) {
   const res = await ghApi('contents/' + path);
   if (!res.ok) return;
   const items = await res.json();
   for (const item of items) {
     if (item.type === 'dir') {
-      await deleteFolder(item.path);
+      await deleteFolderRecursive(item.path);
     } else {
       await ghApi('contents/' + item.path, {
         method: 'DELETE',
@@ -201,6 +216,7 @@ async function deleteFolder(path) {
   }
 }
 
+// ============ Utils ============
 function randomId() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let s = '';
@@ -211,72 +227,97 @@ function randomId() {
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      // dataURL: "data:...;base64,XXXX"
-      const b64 = reader.result.split(',')[1];
-      resolve(b64);
-    };
+    reader.onload = () => resolve(reader.result.split(',')[1]);
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
 }
 
-async function uploadFile(path, base64, message) {
-  const res = await ghApi('contents/' + path, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      message: message,
-      content: base64,
-      branch: 'main'
-    })
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.message || 'Ошибка загрузки');
+// Проверяет, доступна ли страница по URL (200). Максимум 24 попытки по 5 сек = 2 минуты
+async function waitForPage(url, maxTries = 24, delayMs = 5000) {
+  for (let i = 0; i < maxTries; i++) {
+    try {
+      const res = await fetch(url + '?t=' + Date.now(), { method: 'GET', cache: 'no-store' });
+      if (res.status === 200) return true;
+    } catch (e) { /* ignore */ }
+    showStatus(`Ожидаем сборку GitHub Pages… (${i + 1}/${maxTries})`, 'info');
+    await sleep(delayMs);
   }
-  return res.json();
+  return false;
 }
 
+// ============ Main upload flow ============
 uploadBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
   uploadBtn.disabled = true;
   result.className = 'result';
-  showStatus('Шаг 1/3: удаляем старые файлы…', 'info');
+  hideStatus();
+
+  const [owner, repo] = repoInput.value.split('/');
+  const newFolder = randomId();
+  const oldFolder = localStorage.getItem('gh_old_folder') || null;
 
   try {
-    await cleanupOld();
-
-    showStatus('Шаг 2/3: загружаем APK (может занять 10–30 сек)…', 'info');
-    const folder = randomId();
-    const ext = selectedFile.name.split('.').pop() || 'apk';
+    // --- Шаг 1: загружаем APK в новую папку ---
+    const ext = (selectedFile.name.split('.').pop() || 'apk').toLowerCase();
     const fileName = 'file.' + ext;
+
+    showStatus('Шаг 1/4: загружаем APK (10–60 сек)…', 'info');
     const b64 = await fileToBase64(selectedFile);
+    await uploadFile(newFolder + '/' + fileName, b64, 'Загрузка APK');
 
-    // Загружаем файл
-    await uploadFile(folder + '/' + fileName, b64, 'Загрузка ' + selectedFile.name);
-
-    // Создаём index.html для автозагрузки
+    // --- Шаг 2: создаём index.html для автозагрузки ---
+    showStatus('Шаг 2/4: создаём страницу скачивания…', 'info');
     const indexHtml = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <meta http-equiv="refresh" content="0; url=${fileName}">
 <title>Скачивание...</title></head>
-<body>Скачивание началось. <a href="${fileName}">Скачать вручную</a></body>
-</html>`;
+<body style="background:#0f1115;color:#e9edf3;font-family:sans-serif;text-align:center;padding-top:80px">
+Скачивание началось…<br><br>
+<a style="color:#4f8cff" href="${fileName}">Скачать вручную</a>
+</body></html>`;
     const indexB64 = btoa(unescape(encodeURIComponent(indexHtml)));
-    await uploadFile(folder + '/index.html', indexB64, 'Создание страницы');
+    await uploadFile(newFolder + '/index.html', indexB64, 'Создание страницы');
 
-    showStatus('Шаг 3/3: получаем ссылку…', 'info');
+    // --- Шаг 3: ждём, пока новая страница станет доступна ---
+    const newUrl = `https://${owner}.github.io/${repo}/${newFolder}/`;
+    showStatus('Шаг 3/4: ждём, пока GitHub Pages соберёт новую версию…', 'info');
 
-    // Ссылка на папку
-    const [owner, repo] = repoInput.value.split('/');
-    const url = `https://${owner}.github.io/${repo}/${folder}/`;
+    const ready = await waitForPage(newUrl);
+    if (!ready) {
+      showStatus(
+        '⚠️ GitHub Pages не успел собраться за 2 минуты. Старая версия НЕ удалена. Подожди пару минут и попробуй ещё раз — новая уже могла появиться.',
+        'err'
+      );
+      // Всё равно сохраняем как новую, но старую не трогаем
+      localStorage.setItem('gh_old_folder', newFolder);
+      localStorage.setItem('gh_last_url', newUrl);
+      showPrevFolder();
+      showResult(newUrl);
+      return;
+    }
 
-    await new Promise(r => setTimeout(r, 8000)); // ждём GitHub Pages
-    showStatus('✅ Готово! GitHub Pages обновляется (может занять 1–2 минуты)', 'ok');
-    showResult(url);
+    // --- Шаг 4: удаляем старую папку ---
+    if (oldFolder && oldFolder !== newFolder) {
+      showStatus(`Шаг 4/4: новая версия готова. Удаляем старую папку (${oldFolder})…`, 'info');
+      try {
+        await deleteFolderRecursive(oldFolder);
+      } catch (e) {
+        console.warn('Не удалось удалить старую папку:', e);
+      }
+    } else {
+      showStatus('Шаг 4/4: старых папок нет, всё чисто.', 'info');
+    }
+
+    // --- Успех ---
+    localStorage.setItem('gh_old_folder', newFolder);
+    localStorage.setItem('gh_last_url', newUrl);
+    showPrevFolder();
+
+    showStatus('✅ Готово! Новая версия доступна, старая удалена.', 'ok');
+    showResult(newUrl);
   } catch (e) {
-    showStatus('❌ Ошибка: ' + e.message, 'err');
+    showStatus('❌ Ошибка: ' + (e.message || e), 'err');
   } finally {
     uploadBtn.disabled = false;
   }
